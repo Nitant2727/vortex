@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"net/http"
+	"os"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -10,19 +10,15 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/jedib0t/go-pretty/v6/table"
-	"google.golang.org/api/googleapi/transport"
-	"google.golang.org/api/youtube/v3"
+
+	"vortex/pkg/models"
+	"vortex/pkg/ui"
+	"vortex/pkg/utils"
+	"vortex/pkg/youtube"
 )
 
-const developerKey = ""
-
 type model struct {
-	textInput textinput.Model
-	results   [][]string
-	viewport  viewport.Model
-	err       error
-	width     int
-	height    int
+	models.Model
 }
 
 func initialModel() model {
@@ -32,14 +28,17 @@ func initialModel() model {
 	ti.Width = 40
 
 	vp := viewport.New(100, 20)
-	vp.Style = lipgloss.NewStyle().
-		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("62"))
+	vp.Style = ui.ViewportStyle
 
 	return model{
-		textInput: ti,
-		results:   [][]string{},
-		viewport:  vp,
+		Model: models.Model{
+			TextInput:   ti,
+			Results:     [][]string{},
+			Viewport:    vp,
+			Loading:     false,
+			SelectedRow: 0,
+			ShowHelp:    false,
+		},
 	}
 }
 
@@ -55,37 +54,59 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
-		m.viewport.Width = msg.Width - 4
-		m.viewport.Height = msg.Height - 8
+		m.Width = msg.Width
+		m.Height = msg.Height
+		m.Viewport.Width = msg.Width - 4
+		m.Viewport.Height = msg.Height - 8
 
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c", "esc":
 			return m, tea.Quit
 		case "enter":
-			if m.textInput.Value() != "" {
-				results, err := searchYoutube(m.textInput.Value())
-				m.results = results
-				m.err = err
-				if err == nil {
-					m.viewport.SetContent(m.renderTable())
-				}
+			if m.TextInput.Value() != "" {
+				m.Loading = true
+				m.SelectedRow = 0
+				return m, searchYoutubeCmd(m.TextInput.Value())
 			}
+		case "up", "k":
+			if len(m.Results) > 0 {
+				m.SelectedRow = utils.Max(0, m.SelectedRow-1)
+				m.Viewport.SetContent(renderTable(m.Model))
+			}
+		case "down", "j":
+			if len(m.Results) > 0 {
+				m.SelectedRow = utils.Min(len(m.Results)-1, m.SelectedRow+1)
+				m.Viewport.SetContent(renderTable(m.Model))
+			}
+		case "o":
+			if len(m.Results) > 0 && m.SelectedRow < len(m.Results) {
+				videoID := m.Results[m.SelectedRow][2]
+				url := youtube.GetVideoURL(videoID)
+				go utils.OpenBrowser(url)
+			}
+		case "?":
+			m.ShowHelp = !m.ShowHelp
+		}
+	case models.SearchResultMsg:
+		m.Loading = false
+		m.Results = msg.Results
+		m.Err = msg.Err
+		if msg.Err == nil {
+			m.Viewport.SetContent(renderTable(m.Model))
 		}
 	}
 
-	m.textInput, cmd = m.textInput.Update(msg)
+	m.TextInput, cmd = m.TextInput.Update(msg)
 	cmds = append(cmds, cmd)
 
-	m.viewport, cmd = m.viewport.Update(msg)
+	m.Viewport, cmd = m.Viewport.Update(msg)
 	cmds = append(cmds, cmd)
 
 	return m, tea.Batch(cmds...)
 }
 
-func (m model) renderTable() string {
+func renderTable(m models.Model) string {
 	t := table.NewWriter()
 	t.SetStyle(table.Style{
 		Box: table.StyleBoxRounded,
@@ -96,22 +117,30 @@ func (m model) renderTable() string {
 		},
 	})
 
-	t.AppendHeader(table.Row{"#", "Title", "Channel", "Video ID"})
+	t.AppendHeader(table.Row{"#", "Title", "Channel", "Video ID", "URL"})
 
-	for i, row := range m.results {
+	for i, row := range m.Results {
+		videoURL := youtube.GetVideoURL(row[2])
+		style := lipgloss.NewStyle()
+		if i == m.SelectedRow {
+			style = style.Background(lipgloss.Color("62")).Foreground(lipgloss.Color("0"))
+		}
+
 		t.AppendRow(table.Row{
-			i + 1,
-			lipgloss.NewStyle().MaxWidth(60).Render(row[0]),
-			lipgloss.NewStyle().MaxWidth(30).Render(row[1]),
-			row[2],
+			style.Render(fmt.Sprint(i + 1)),
+			style.Copy().MaxWidth(50).Render(row[0]),
+			style.Copy().MaxWidth(25).Render(row[1]),
+			style.Render(row[2]),
+			style.Copy().Foreground(lipgloss.Color("45")).Render(videoURL),
 		})
 	}
 
 	t.SetColumnConfigs([]table.ColumnConfig{
 		{Number: 1, WidthMin: 3, WidthMax: 3},
-		{Number: 2, WidthMin: 60, WidthMax: 60},
-		{Number: 3, WidthMin: 30, WidthMax: 30},
-		{Number: 4, WidthMin: 15, WidthMax: 15},
+		{Number: 2, WidthMin: 50, WidthMax: 50},
+		{Number: 3, WidthMin: 25, WidthMax: 25},
+		{Number: 4, WidthMin: 12, WidthMax: 12},
+		{Number: 5, WidthMin: 45, WidthMax: 45},
 	})
 
 	return t.Render()
@@ -120,64 +149,51 @@ func (m model) renderTable() string {
 func (m model) View() string {
 	var s strings.Builder
 
-	s.WriteString(lipgloss.NewStyle().
-		Foreground(lipgloss.Color("62")).
-		Bold(true).
-		Render("YouTube Search CLI") + "\n\n")
+	s.WriteString(ui.TitleStyle.Render("YouTube Search CLI"))
+	s.WriteString("\n\n")
+	s.WriteString(m.TextInput.View())
+	s.WriteString("\n\n")
 
-	s.WriteString(m.textInput.View() + "\n\n")
-
-	if m.err != nil {
-		return s.String() + lipgloss.NewStyle().
-			Foreground(lipgloss.Color("196")).
-			Render(fmt.Sprintf("Error: %v\n", m.err))
+	if m.Loading {
+		return s.String() + ui.LoadingStyle.Render("Searching...")
 	}
 
-	if len(m.results) > 0 {
-		s.WriteString(m.viewport.View() + "\n")
+	if m.Err != nil {
+		return s.String() + ui.ErrorStyle.Render(fmt.Sprintf("Error: %v", m.Err))
 	}
 
-	s.WriteString("\n" + lipgloss.NewStyle().
-		Foreground(lipgloss.Color("241")).
-		Render("↑/↓: Scroll • Enter: Search • Esc: Quit"))
+	if len(m.Results) > 0 {
+		s.WriteString(m.Viewport.View())
+		s.WriteString("\n")
+	}
+
+	s.WriteString("\n")
+	if m.ShowHelp {
+		s.WriteString(ui.HelpStyle.Render("Controls:\n"))
+		s.WriteString(ui.HelpStyle.Render("↑/k, ↓/j: Navigate • Enter: Search • o: Open in browser • ?: Toggle help • Esc: Quit"))
+	} else {
+		s.WriteString(ui.HelpStyle.Render("↑/↓: Navigate • Enter: Search • o: Open • ?: Help • Esc: Quit"))
+	}
 
 	return s.String()
 }
 
-func searchYoutube(query string) ([][]string, error) {
-	client := &http.Client{
-		Transport: &transport.APIKey{Key: developerKey},
+func searchYoutubeCmd(query string) tea.Cmd {
+	return func() tea.Msg {
+		results, err := youtube.Search(query)
+		return models.SearchResultMsg{Results: results, Err: err}
 	}
-
-	service, err := youtube.New(client)
-	if err != nil {
-		return nil, err
-	}
-
-	call := service.Search.List([]string{"snippet"}).
-		Q(query).
-		MaxResults(25)
-
-	response, err := call.Do()
-	if err != nil {
-		return nil, err
-	}
-
-	var results [][]string
-	for _, item := range response.Items {
-		results = append(results, []string{
-			item.Snippet.Title,
-			item.Snippet.ChannelTitle,
-			item.Id.VideoId,
-		})
-	}
-
-	return results, nil
 }
 
 func main() {
-	p := tea.NewProgram(initialModel())
+	p := tea.NewProgram(
+		initialModel(),
+		tea.WithAltScreen(),
+		tea.WithMouseCellMotion(),
+	)
+
 	if _, err := p.Run(); err != nil {
-		fmt.Printf("Error running program: %v", err)
+		fmt.Printf("Error running program: %v\n", err)
+		os.Exit(1)
 	}
 }
